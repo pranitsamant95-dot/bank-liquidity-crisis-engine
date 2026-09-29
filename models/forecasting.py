@@ -52,12 +52,19 @@ def _naive(series: pd.Series, horizon: int, confidence: float) -> ForecastResult
     steps = np.sqrt(np.arange(1, horizon + 1))
     mean = pd.Series(last, index=idx)
     margin = _z(confidence) * sigma * steps
-    return ForecastResult("Naive", mean, pd.Series(mean.values - margin, idx).clip(0, 100), pd.Series(mean.values + margin, idx).clip(0, 100), residuals, {"assumption": "Random walk; last observation is the forecast."})
+    return ForecastResult(
+        "Naive", mean,
+        pd.Series(mean.values - margin, idx).clip(0, 100),
+        pd.Series(mean.values + margin, idx).clip(0, 100),
+        residuals,
+        {"assumption": "Random walk; last observation is the forecast."},
+    )
 
 
 def _arima(series: pd.Series, horizon: int, confidence: float, optimize: bool) -> ForecastResult:
     best = None
-    candidates = [(1, 1, 1)] if not optimize else [(p, 1, q) for p in (0, 1, 2) for q in (0, 1, 2) if p + q > 0]
+    # Small bounded grid for final forecasts. Validation calls use one fixed order via optimize=False.
+    candidates = [(1, 1, 1)] if not optimize else [(0, 1, 1), (1, 1, 0), (1, 1, 1), (2, 1, 1), (1, 1, 2)]
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         for order in candidates:
@@ -73,42 +80,68 @@ def _arima(series: pd.Series, horizon: int, confidence: float, optimize: bool) -
     pred = fit.get_forecast(horizon)
     ci = pred.conf_int(alpha=1 - confidence)
     idx = _future_index(series, horizon)
-    return ForecastResult("ARIMA", pd.Series(pred.predicted_mean.values, idx).clip(0, 100), pd.Series(ci.iloc[:, 0].values, idx).clip(0, 100), pd.Series(ci.iloc[:, 1].values, idx).clip(0, 100), pd.Series(fit.resid, index=series.index[-len(fit.resid):]).dropna(), {"order": order, "aic": float(fit.aic), "parameters": {str(k): float(v) for k, v in fit.params.items()}})
+    residuals = pd.Series(np.asarray(fit.resid), index=series.index[-len(fit.resid):]).dropna()
+    return ForecastResult(
+        "ARIMA",
+        pd.Series(pred.predicted_mean.values, idx).clip(0, 100),
+        pd.Series(ci.iloc[:, 0].values, idx).clip(0, 100),
+        pd.Series(ci.iloc[:, 1].values, idx).clip(0, 100),
+        residuals,
+        {"order": order, "aic": float(fit.aic), "parameters": {str(k): float(v) for k, v in fit.params.items()}},
+    )
 
 
 def _sarima(series: pd.Series, horizon: int, confidence: float) -> ForecastResult:
     period = 13
     if not seasonality_justified(series, period):
-        raise ValueError("Quarterly (13-week) seasonality is not sufficiently supported by the observed autocorrelation.")
+        raise ValueError("13-week seasonality is not sufficiently supported by the observed autocorrelation.")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        fit = SARIMAX(series, order=(1, 1, 1), seasonal_order=(1, 0, 0, period), enforce_stationarity=False, enforce_invertibility=False).fit(disp=False, maxiter=100)
+        fit = SARIMAX(
+            series, order=(1, 1, 1), seasonal_order=(1, 0, 0, period),
+            enforce_stationarity=False, enforce_invertibility=False,
+        ).fit(disp=False, maxiter=100)
     pred = fit.get_forecast(horizon)
     ci = pred.conf_int(alpha=1 - confidence)
     idx = _future_index(series, horizon)
-    return ForecastResult("SARIMA", pd.Series(pred.predicted_mean.values, idx).clip(0, 100), pd.Series(ci.iloc[:, 0].values, idx).clip(0, 100), pd.Series(ci.iloc[:, 1].values, idx).clip(0, 100), pd.Series(fit.resid, index=series.index[-len(fit.resid):]).dropna(), {"order": (1, 1, 1), "seasonal_order": (1, 0, 0, period), "aic": float(fit.aic)})
+    residuals = pd.Series(np.asarray(fit.resid), index=series.index[-len(fit.resid):]).dropna()
+    return ForecastResult(
+        "SARIMA",
+        pd.Series(pred.predicted_mean.values, idx).clip(0, 100),
+        pd.Series(ci.iloc[:, 0].values, idx).clip(0, 100),
+        pd.Series(ci.iloc[:, 1].values, idx).clip(0, 100),
+        residuals,
+        {"order": (1, 1, 1), "seasonal_order": (1, 0, 0, period), "aic": float(fit.aic)},
+    )
 
 
 def _ets(series: pd.Series, horizon: int, confidence: float) -> ForecastResult:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        fit = ExponentialSmoothing(series, trend="add", damped_trend=True, seasonal=None, initialization_method="estimated").fit(optimized=True)
+        fit = ExponentialSmoothing(
+            series, trend="add", damped_trend=True, seasonal=None, initialization_method="estimated"
+        ).fit(optimized=True)
     idx = _future_index(series, horizon)
     mean = pd.Series(np.asarray(fit.forecast(horizon)), idx).clip(0, 100)
     residuals = pd.Series(np.asarray(fit.resid), index=series.index).dropna()
     sigma = float(residuals.std(ddof=1)) if len(residuals) > 1 else 1.0
     margin = _z(confidence) * sigma * np.sqrt(np.arange(1, horizon + 1))
-    return ForecastResult("Exponential Smoothing", mean, pd.Series(mean.values - margin, idx).clip(0, 100), pd.Series(mean.values + margin, idx).clip(0, 100), residuals, {"trend": "damped additive", "smoothing_parameters": {k: float(v) for k, v in fit.params.items() if np.isscalar(v) and v is not None}})
+    return ForecastResult(
+        "Exponential Smoothing", mean,
+        pd.Series(mean.values - margin, idx).clip(0, 100),
+        pd.Series(mean.values + margin, idx).clip(0, 100),
+        residuals,
+        {"trend": "damped additive", "smoothing_parameters": {k: float(v) for k, v in fit.params.items() if np.isscalar(v) and v is not None}},
+    )
 
 
 def _var(series: pd.Series, multivariate: pd.DataFrame, horizon: int, confidence: float) -> ForecastResult:
-    columns = [series.name] + [c for c in multivariate.columns if c != series.name]
     levels = pd.concat([series.rename(series.name), multivariate.drop(columns=[series.name], errors="ignore")], axis=1)
-    levels = levels.loc[:, ~levels.columns.duplicated()].dropna().tail(260)
+    levels = levels.loc[:, ~levels.columns.duplicated()].dropna().tail(220)
     if len(levels) < 80 or levels.shape[1] < 2:
         raise ValueError("VAR requires at least 80 complete multivariate observations.")
     differences = levels.diff().dropna()
-    maxlags = min(4, max(1, len(differences) // 20))
+    maxlags = min(4, max(1, len(differences) // 30))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         selection = VAR(differences).select_order(maxlags=maxlags)
@@ -123,13 +156,28 @@ def _var(series: pd.Series, multivariate: pd.DataFrame, horizon: int, confidence
     target = levels.columns.get_loc(series.name)
     idx = _future_index(series, horizon)
     residuals = pd.Series(fit.resid.iloc[:, target].values, index=fit.resid.index)
-    return ForecastResult("VAR", pd.Series(level_point[:, target], idx).clip(0, 100), pd.Series(level_lower[:, target], idx).clip(0, 100), pd.Series(level_upper[:, target], idx).clip(0, 100), residuals, {"lag_order": lag, "variables": list(levels.columns), "aic": float(fit.aic)})
+    return ForecastResult(
+        "VAR", pd.Series(level_point[:, target], idx).clip(0, 100),
+        pd.Series(level_lower[:, target], idx).clip(0, 100),
+        pd.Series(level_upper[:, target], idx).clip(0, 100),
+        residuals,
+        {"lag_order": lag, "variables": list(levels.columns), "aic": float(fit.aic)},
+    )
 
 
-def forecast_model(model: str, series: pd.Series, horizon: int, confidence: float = 0.95, multivariate: pd.DataFrame | None = None, optimize: bool = True) -> ForecastResult:
-    clean = series.replace([np.inf, -np.inf], np.nan).dropna().astype(float).tail(520)
+def forecast_model(
+    model: str,
+    series: pd.Series,
+    horizon: int,
+    confidence: float = 0.95,
+    multivariate: pd.DataFrame | None = None,
+    optimize: bool = True,
+) -> ForecastResult:
+    clean = series.replace([np.inf, -np.inf], np.nan).dropna().astype(float).tail(360)
     if len(clean) < 40:
         raise ValueError("At least 40 valid weekly stress observations are required for forecasting.")
+    if horizon < 1:
+        raise ValueError("Forecast horizon must be at least one week.")
     if model == "Naive":
         return _naive(clean, horizon, confidence)
     if model == "ARIMA":
