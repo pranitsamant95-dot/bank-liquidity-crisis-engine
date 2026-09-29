@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -31,61 +33,129 @@ SERIES: Dict[str, SeriesSpec] = {
     "treasury_3m": SeriesSpec("DGS3MO", "3-month Treasury yield", "Percent", "Federal Reserve H.15 via FRED", "Daily"),
 }
 
+FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+MAX_WORKERS = 5
+REQUEST_TIMEOUT = (3.05, 7.0)
+MAX_LIVE_SECONDS = 11.0
+
 
 def _session() -> requests.Session:
-    retry = Retry(total=3, connect=3, read=3, backoff_factor=0.6, status_forcelist=(429, 500, 502, 503, 504))
+    retry = Retry(
+        total=1,
+        connect=1,
+        read=1,
+        backoff_factor=0.25,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        raise_on_status=False,
+    )
     session = requests.Session()
-    session.mount("https://", HTTPAdapter(max_retries=retry))
-    session.headers.update({"User-Agent": "bank-liquidity-academic-engine/1.0"})
+    session.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS))
+    session.headers.update({"User-Agent": "bank-liquidity-academic-engine/1.1"})
     return session
 
 
-def _download_fred(series_id: str, start: str, session: requests.Session) -> pd.Series:
-    url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=" + series_id + "&cosd=" + start
-    response = session.get(url, timeout=25)
-    response.raise_for_status()
-    from io import StringIO
+def _download_fred(spec: SeriesSpec, start: str) -> pd.Series:
+    url = f"{FRED_URL}?id={spec.series_id}&cosd={start}"
+    session = _session()
+    try:
+        response = session.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        frame = pd.read_csv(StringIO(response.text))
+    finally:
+        session.close()
 
-    frame = pd.read_csv(StringIO(response.text))
-    date_col = frame.columns[0]
-    value_col = frame.columns[1]
+    if frame.shape[1] < 2:
+        raise ValueError(f"FRED returned an unexpected response for {spec.series_id}.")
+    date_col, value_col = frame.columns[0], frame.columns[1]
     frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
     frame[value_col] = pd.to_numeric(frame[value_col].replace(".", pd.NA), errors="coerce")
     series = frame.dropna(subset=[date_col]).set_index(date_col)[value_col].sort_index()
-    series.name = series_id
+    series.name = spec.series_id
     if series.dropna().empty:
-        raise ValueError(f"FRED returned no numeric observations for {series_id}.")
+        raise ValueError(f"FRED returned no numeric observations for {spec.series_id}.")
     return series
 
 
 def _to_weekly(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
     frame = frame[~frame.index.duplicated(keep="last")].sort_index()
     weekly = frame.resample("W-FRI").last()
     # Limited carry-forward bridges holidays and short publication gaps without hiding long outages.
-    weekly = weekly.ffill(limit=4)
-    return weekly
+    return weekly.ffill(limit=4)
 
 
-def load_financial_data(start: str = "2000-01-01", snapshot_path: str | Path | None = None) -> Tuple[pd.DataFrame, dict]:
-    """Load official FRED series. If live retrieval is incomplete, use the bundled official snapshot.
+def _read_snapshot(snapshot: Path) -> pd.DataFrame:
+    if not snapshot.exists():
+        return pd.DataFrame()
+    try:
+        frame = pd.read_csv(snapshot, parse_dates=["date"]).set_index("date").sort_index()
+    except Exception:
+        return pd.DataFrame()
+    return _to_weekly(frame)
 
-    Returns (weekly_frame, status). The status object identifies live/snapshot coverage and failures.
-    """
-    session = _session()
+
+def _snapshot_is_sufficient(frame: pd.DataFrame, start: str) -> bool:
+    if frame.empty:
+        return False
+    required = [c for c in SERIES if c in frame.columns]
+    if len(required) != len(SERIES):
+        return False
+    usable = frame.loc[pd.Timestamp(start):, required].dropna(how="all")
+    return len(usable) >= 80
+
+
+def _download_concurrently(start: str) -> tuple[dict[str, pd.Series], dict[str, str]]:
     downloaded: dict[str, pd.Series] = {}
     failures: dict[str, str] = {}
-    for key, spec in SERIES.items():
-        try:
-            downloaded[key] = _download_fred(spec.series_id, start, session)
-        except Exception as exc:  # network and provider errors are reported to the UI
-            failures[key] = f"{type(exc).__name__}: {exc}"
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="fred")
+    futures = {executor.submit(_download_fred, spec, start): key for key, spec in SERIES.items()}
+    try:
+        for future in as_completed(futures, timeout=MAX_LIVE_SECONDS):
+            key = futures[future]
+            try:
+                downloaded[key] = future.result()
+            except Exception as exc:
+                failures[key] = f"{type(exc).__name__}: {exc}"
+    except FuturesTimeoutError:
+        for future, key in futures.items():
+            if not future.done():
+                future.cancel()
+                failures[key] = "Live FRED request timed out; snapshot fallback applied where available."
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    return downloaded, failures
 
-    live = _to_weekly(pd.concat(downloaded, axis=1)) if downloaded else pd.DataFrame()
+
+def load_financial_data(
+    start: str = "2000-01-01",
+    snapshot_path: str | Path | None = None,
+    refresh_live: bool = False,
+) -> Tuple[pd.DataFrame, dict]:
+    """Load official FRED series with a fast official-snapshot path and bounded concurrent refresh.
+
+    The bundled snapshot is preferred when it contains all required series and enough history.
+    Live FRED retrieval is used when explicitly requested or when no sufficient snapshot exists.
+    No synthetic observations are created.
+    """
     snapshot = Path(snapshot_path) if snapshot_path else Path(__file__).resolve().parents[1] / "data" / "fred_snapshot.csv"
-    snapshot_frame = pd.DataFrame()
-    if snapshot.exists():
-        snapshot_frame = pd.read_csv(snapshot, parse_dates=["date"]).set_index("date").sort_index()
-        snapshot_frame = _to_weekly(snapshot_frame)
+    snapshot_frame = _read_snapshot(snapshot)
+    snapshot_ready = _snapshot_is_sufficient(snapshot_frame, start)
+
+    if snapshot_ready and not refresh_live:
+        combined = snapshot_frame.reindex(columns=list(SERIES)).apply(pd.to_numeric, errors="coerce")
+        combined = combined.loc[pd.Timestamp(start):]
+        return combined, {
+            "mode": "official snapshot",
+            "failures": {},
+            "coverage": {col: int(combined[col].notna().sum()) for col in combined.columns},
+            "last_observation": combined.dropna(how="all").index.max(),
+            "snapshot_path": str(snapshot),
+        }
+
+    downloaded, failures = _download_concurrently(start)
+    live = _to_weekly(pd.concat(downloaded, axis=1)) if downloaded else pd.DataFrame()
 
     if live.empty and snapshot_frame.empty:
         raise RuntimeError("Live FRED retrieval failed and no bundled official-data snapshot is available.")
@@ -93,23 +163,29 @@ def load_financial_data(start: str = "2000-01-01", snapshot_path: str | Path | N
     if live.empty:
         combined = snapshot_frame
         mode = "official snapshot"
+    elif snapshot_frame.empty:
+        combined = live
+        mode = "live FRED" if not failures else "live FRED: partial"
     else:
+        # Live observations take precedence; snapshot fills missing columns/observations.
         combined = live.combine_first(snapshot_frame)
-        missing_live = set(SERIES).difference(combined.columns)
-        if missing_live:
-            failures.update({key: "Series unavailable in live and snapshot data" for key in missing_live})
-        mode = "live FRED" if not failures else ("live FRED with official snapshot fallback" if not snapshot_frame.empty else "partial live FRED coverage")
+        mode = "live FRED" if not failures else "live FRED: partial"
 
     combined = combined.reindex(columns=list(SERIES)).apply(pd.to_numeric, errors="coerce")
     combined = combined.loc[pd.Timestamp(start):]
-    coverage = {col: int(combined[col].notna().sum()) for col in combined.columns}
+    for key in SERIES:
+        if combined[key].notna().sum() == 0:
+            failures.setdefault(key, "No usable observation in live data or official snapshot.")
+
     status = {
         "mode": mode,
         "failures": failures,
-        "coverage": coverage,
-        "last_observation": combined.dropna(how="all").index.max(),
+        "coverage": {col: int(combined[col].notna().sum()) for col in combined.columns},
+        "last_observation": combined.dropna(how="all").index.max() if not combined.empty else None,
         "snapshot_path": str(snapshot) if snapshot.exists() else None,
     }
+    if combined.dropna(how="all").empty:
+        raise RuntimeError("No usable official observations were available from FRED or the bundled snapshot.")
     return combined, status
 
 
